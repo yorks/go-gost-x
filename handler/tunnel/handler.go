@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-gost/core/handler"
+	"github.com/go-gost/core/limiter/traffic"
 	"github.com/go-gost/core/listener"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
@@ -17,6 +18,8 @@ import (
 	"github.com/go-gost/relay"
 	ctxvalue "github.com/go-gost/x/ctx"
 	xnet "github.com/go-gost/x/internal/net"
+	limiter_util "github.com/go-gost/x/internal/util/limiter"
+	stats_util "github.com/go-gost/x/internal/util/stats"
 	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
@@ -45,6 +48,9 @@ type tunnelHandler struct {
 	ep       *entrypoint
 	md       metadata
 	log      logger.Logger
+	stats    *stats_util.HandlerStats
+	limiter  traffic.TrafficLimiter
+	cancel   context.CancelFunc
 }
 
 func NewHandler(opts ...handler.Option) handler.Handler {
@@ -95,6 +101,18 @@ func (h *tunnelHandler) Init(md md.Metadata) (err error) {
 	}
 	if err = h.initEntrypoint(); err != nil {
 		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+
+	if h.options.Observer != nil {
+		h.stats = stats_util.NewHandlerStats(h.options.Service)
+		go h.observeStats(ctx)
+	}
+
+	if limiter := h.options.Limiter; limiter != nil {
+		h.limiter = limiter_util.NewCachedTrafficLimiter(limiter, 30*time.Second, 60*time.Second)
 	}
 
 	return nil
@@ -268,6 +286,11 @@ func (h *tunnelHandler) Close() error {
 		h.epSvc.Close()
 	}
 	h.pool.Close()
+
+	if h.cancel != nil {
+		h.cancel()
+	}
+
 	return nil
 }
 
@@ -281,4 +304,26 @@ func (h *tunnelHandler) checkRateLimit(addr net.Addr) bool {
 	}
 
 	return true
+}
+
+func (h *tunnelHandler) observeStats(ctx context.Context) {
+	if h.options.Observer == nil {
+		return
+	}
+
+	d := h.md.observePeriod
+	if d < time.Millisecond {
+		d = 5 * time.Second
+	}
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			h.options.Observer.Observe(ctx, h.stats.Events())
+		case <-ctx.Done():
+			return
+		}
+	}
 }

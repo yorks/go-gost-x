@@ -2,13 +2,20 @@ package tunnel
 
 import (
 	"context"
+	"net"
 	"sync"
 	"time"
 
+	"github.com/go-gost/core/limiter"
+	"github.com/go-gost/core/limiter/traffic"
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/sd"
 	"github.com/go-gost/relay"
 	"github.com/go-gost/x/internal/util/mux"
+
+	"github.com/go-gost/core/observer/stats"
+	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
+	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	"github.com/go-gost/x/selector"
 	"github.com/google/uuid"
 )
@@ -17,23 +24,34 @@ const (
 	MaxWeight uint8 = 0xff
 )
 
+type ConnectorOptions struct {
+	service string
+	sd      sd.SD
+	stats   *stats.Stats
+	limiter traffic.TrafficLimiter
+}
+
 type Connector struct {
 	id   relay.ConnectorID
 	tid  relay.TunnelID
 	node string
-	sd   sd.SD
-	t    time.Time
 	s    *mux.Session
+	t    time.Time
+	opts *ConnectorOptions
 }
 
-func NewConnector(id relay.ConnectorID, tid relay.TunnelID, node string, s *mux.Session, sd sd.SD) *Connector {
+func NewConnector(id relay.ConnectorID, tid relay.TunnelID, node string, s *mux.Session, opts *ConnectorOptions) *Connector {
+	if opts == nil {
+		opts = &ConnectorOptions{}
+	}
+
 	c := &Connector{
 		id:   id,
 		tid:  tid,
 		node: node,
-		sd:   sd,
-		t:    time.Now(),
 		s:    s,
+		t:    time.Now(),
+		opts: opts,
 	}
 	go c.accept()
 	return c
@@ -45,8 +63,8 @@ func (c *Connector) accept() {
 		if err != nil {
 			logger.Default().Errorf("connector %s: %v", c.id, err)
 			c.s.Close()
-			if c.sd != nil {
-				c.sd.Deregister(context.Background(), &sd.Service{
+			if c.opts.sd != nil {
+				c.opts.sd.Deregister(context.Background(), &sd.Service{
 					ID:   c.id.String(),
 					Name: c.tid.String(),
 					Node: c.node,
@@ -62,8 +80,33 @@ func (c *Connector) ID() relay.ConnectorID {
 	return c.id
 }
 
-func (c *Connector) Session() *mux.Session {
-	return c.s
+func (c *Connector) GetConn() (net.Conn, error) {
+	if c == nil || c.s == nil {
+		return nil, nil
+	}
+
+	conn, err := c.s.GetConn()
+	if err != nil {
+		return nil, err
+	}
+
+	conn = stats_wrapper.WrapConn(conn, c.opts.stats)
+
+	network := "tcp"
+	if c.id.IsUDP() {
+		network = "udp"
+	}
+	conn = traffic_wrapper.WrapConn(
+		conn,
+		c.opts.limiter,
+		c.tid.String(),
+		limiter.ScopeOption(limiter.ScopeClient),
+		limiter.ServiceOption(c.opts.service),
+		limiter.ClientOption(c.tid.String()),
+		limiter.NetworkOption(network),
+		limiter.SrcOption(conn.RemoteAddr().String()),
+	)
+	return conn, nil
 }
 
 func (c *Connector) Close() error {
@@ -72,6 +115,14 @@ func (c *Connector) Close() error {
 	}
 
 	return c.s.Close()
+}
+
+func (c *Connector) IsClosed() bool {
+	if c == nil || c.s == nil {
+		return true
+	}
+
+	return c.s.IsClosed()
 }
 
 type Tunnel struct {
@@ -83,7 +134,6 @@ type Tunnel struct {
 	mu         sync.RWMutex
 	sd         sd.SD
 	ttl        time.Duration
-	// rw         *selector.RandomWeighted[*Connector]
 }
 
 func NewTunnel(node string, tid relay.TunnelID, ttl time.Duration) *Tunnel {
@@ -93,7 +143,6 @@ func NewTunnel(node string, tid relay.TunnelID, ttl time.Duration) *Tunnel {
 		t:     time.Now(),
 		close: make(chan struct{}),
 		ttl:   ttl,
-		// rw:    selector.NewRandomWeighted[*Connector](),
 	}
 	if t.ttl <= 0 {
 		t.ttl = defaultTTL
@@ -125,9 +174,6 @@ func (t *Tunnel) GetConnector(network string) *Connector {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	// rw := t.rw
-	// rw.Reset()
-
 	if len(t.connectors) == 1 {
 		return t.connectors[0]
 	}
@@ -136,7 +182,7 @@ func (t *Tunnel) GetConnector(network string) *Connector {
 
 	found := false
 	for _, c := range t.connectors {
-		if c.Session().IsClosed() {
+		if c.IsClosed() {
 			continue
 		}
 
@@ -206,7 +252,7 @@ func (t *Tunnel) clean() {
 			}
 			var connectors []*Connector
 			for _, c := range t.connectors {
-				if c.Session().IsClosed() {
+				if c.IsClosed() {
 					logger.Default().Debugf("remove tunnel: %s, connector: %s", t.id, c.id)
 					if t.sd != nil {
 						t.sd.Deregister(context.Background(), &sd.Service{
